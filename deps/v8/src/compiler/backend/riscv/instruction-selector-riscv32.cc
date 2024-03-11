@@ -9,6 +9,8 @@
 #include "src/compiler/backend/riscv/instruction-selector-riscv.h"
 #include "src/compiler/node-matchers.h"
 #include "src/compiler/node-properties.h"
+#include "src/compiler/turboshaft/operations.h"
+#include "src/compiler/turboshaft/opmasks.h"
 
 namespace v8 {
 namespace internal {
@@ -60,8 +62,9 @@ bool RiscvOperandGeneratorT<Adapter>::CanBeImmediate(int64_t value,
 }
 
 template <typename Adapter>
-void EmitLoad(InstructionSelectorT<Adapter>* selector, Node* node,
-              InstructionCode opcode, Node* output = nullptr) {
+void EmitLoad(InstructionSelectorT<Adapter>* selector,
+              typename Adapter::node_t node, InstructionCode opcode,
+              typename Adapter::node_t output = typename Adapter::node_t{}) {
   RiscvOperandGeneratorT<Adapter> g(selector);
   Node* base = node->InputAt(0);
   Node* index = node->InputAt(1);
@@ -230,6 +233,18 @@ void InstructionSelectorT<Adapter>::VisitStorePair(node_t node) {
 template <>
 void InstructionSelectorT<TurboshaftAdapter>::VisitStore(turboshaft::OpIndex) {
   UNREACHABLE();
+}
+
+template <typename Adapter>
+void InstructionSelectorT<Adapter>::VisitProtectedLoad(node_t node) {
+  // TODO(eholk)
+  UNIMPLEMENTED();
+}
+
+template <typename Adapter>
+void InstructionSelectorT<Adapter>::VisitProtectedStore(node_t node) {
+  // TODO(eholk)
+  UNIMPLEMENTED();
 }
 
 template <>
@@ -402,13 +417,18 @@ void InstructionSelectorT<Adapter>::VisitWord32ReverseBytes(node_t node) {
     UNIMPLEMENTED();
   } else {
     RiscvOperandGeneratorT<Adapter> g(this);
+#ifdef CAN_USE_ZBB_INSTRUCTIONS
+    Emit(kRiscvRev8, g.DefineAsRegister(node),
+         g.UseRegister(this->input_at(node, 0)));
+#else
     Emit(kRiscvByteSwap32, g.DefineAsRegister(node),
          g.UseRegister(node->InputAt(0)));
+#endif
   }
 }
 
 template <typename Adapter>
-void InstructionSelectorT<Adapter>::VisitSimd128ReverseBytes(Node* node) {
+void InstructionSelectorT<Adapter>::VisitSimd128ReverseBytes(node_t node) {
   UNREACHABLE();
 }
 
@@ -423,29 +443,20 @@ void InstructionSelectorT<Adapter>::VisitWord32Popcnt(node_t node) {
   }
 }
 
-template <>
-void InstructionSelectorT<TurboshaftAdapter>::VisitInt32Add(node_t node) {
-  UNIMPLEMENTED();
-}
-
-template <>
-void InstructionSelectorT<TurbofanAdapter>::VisitInt32Add(Node* node) {
-  VisitBinop<TurbofanAdapter, Int32BinopMatcher>(this, node, kRiscvAdd32, true,
+template <typename Adapter>
+void InstructionSelectorT<Adapter>::VisitInt32Add(node_t node) {
+  VisitBinop<Adapter, Int32BinopMatcher>(this, node, kRiscvAdd32, true,
                                          kRiscvAdd32);
 }
 
 template <typename Adapter>
 void InstructionSelectorT<Adapter>::VisitInt32Sub(node_t node) {
-  if constexpr (Adapter::IsTurboshaft) {
-    UNIMPLEMENTED();
-  } else {
   VisitBinop<Adapter, Int32BinopMatcher>(this, node, kRiscvSub32);
-  }
 }
 
 template <>
 void InstructionSelectorT<TurboshaftAdapter>::VisitInt32Mul(node_t node) {
-  UNIMPLEMENTED();
+  VisitRRR(this, kRiscvMul32, node);
 }
 
 template <>
@@ -932,9 +943,15 @@ void VisitWordCompare(InstructionSelectorT<Adapter>* selector,
 }
 
 template <typename Adapter>
-void VisitAtomicLoad(InstructionSelectorT<Adapter>* selector, Node* node,
-                     ArchOpcode opcode, AtomicWidth width) {
-  RiscvOperandGeneratorT<Adapter> g(selector);
+void VisitAtomicLoad(InstructionSelectorT<Adapter>* selector,
+                     turboshaft::OpIndex node, ArchOpcode opcode,
+                     AtomicWidth width) {
+  UNIMPLEMENTED();
+}
+
+void VisitAtomicLoad(InstructionSelectorT<TurbofanAdapter>* selector,
+                     Node* node, ArchOpcode opcode, AtomicWidth width) {
+  RiscvOperandGeneratorT<TurbofanAdapter> g(selector);
   Node* base = node->InputAt(0);
   Node* index = node->InputAt(1);
   if (g.CanBeImmediate(index, opcode)) {
@@ -1047,115 +1064,210 @@ void InstructionSelectorT<Adapter>::VisitStackPointerGreaterThan(
 }
 
 // Shared routine for word comparisons against zero.
-template <typename Adapter>
-void InstructionSelectorT<Adapter>::VisitWordCompareZero(
-    node_t user, node_t value, FlagsContinuationT<Adapter>* cont) {
-  if constexpr (Adapter::IsTurboshaft) {
-    UNIMPLEMENTED();
-  } else {
-    // Try to combine with comparisons against 0 by simply inverting the branch.
-    while (CanCover(user, value)) {
-      if (value->opcode() == IrOpcode::kWord32Equal) {
-        Int32BinopMatcher m(value);
-        if (!m.right().Is(0)) break;
-        user = value;
-        value = m.left().node();
-      } else if (value->opcode() == IrOpcode::kWord64Equal) {
-        Int64BinopMatcher m(value);
-        if (!m.right().Is(0)) break;
-        user = value;
-        value = m.left().node();
-      } else {
-        break;
-      }
-
-      cont->Negate();
+template <>
+void InstructionSelectorT<TurbofanAdapter>::VisitWordCompareZero(
+    node_t user, node_t value, FlagsContinuationT<TurbofanAdapter>* cont) {
+  // Try to combine with comparisons against 0 by simply inverting the branch.
+  while (CanCover(user, value)) {
+    if (value->opcode() == IrOpcode::kWord32Equal) {
+      Int32BinopMatcher m(value);
+      if (!m.right().Is(0)) break;
+      user = value;
+      value = m.left().node();
+    } else if (value->opcode() == IrOpcode::kWord64Equal) {
+      Int64BinopMatcher m(value);
+      if (!m.right().Is(0)) break;
+      user = value;
+      value = m.left().node();
+    } else {
+      break;
     }
 
-    if (CanCover(user, value)) {
-      switch (value->opcode()) {
-        case IrOpcode::kWord32Equal:
-          cont->OverwriteAndNegateIfEqual(kEqual);
-          return VisitWordCompare(this, value, cont);
-        case IrOpcode::kInt32LessThan:
-          cont->OverwriteAndNegateIfEqual(kSignedLessThan);
-          return VisitWordCompare(this, value, cont);
-        case IrOpcode::kInt32LessThanOrEqual:
-          cont->OverwriteAndNegateIfEqual(kSignedLessThanOrEqual);
-          return VisitWordCompare(this, value, cont);
-        case IrOpcode::kUint32LessThan:
-          cont->OverwriteAndNegateIfEqual(kUnsignedLessThan);
-          return VisitWordCompare(this, value, cont);
-        case IrOpcode::kUint32LessThanOrEqual:
-          cont->OverwriteAndNegateIfEqual(kUnsignedLessThanOrEqual);
-          return VisitWordCompare(this, value, cont);
-        case IrOpcode::kFloat32Equal:
-          cont->OverwriteAndNegateIfEqual(kEqual);
-          return VisitFloat32Compare(this, value, cont);
-        case IrOpcode::kFloat32LessThan:
-          cont->OverwriteAndNegateIfEqual(kUnsignedLessThan);
-          return VisitFloat32Compare(this, value, cont);
-        case IrOpcode::kFloat32LessThanOrEqual:
-          cont->OverwriteAndNegateIfEqual(kUnsignedLessThanOrEqual);
-          return VisitFloat32Compare(this, value, cont);
-        case IrOpcode::kFloat64Equal:
-          cont->OverwriteAndNegateIfEqual(kEqual);
-          return VisitFloat64Compare(this, value, cont);
-        case IrOpcode::kFloat64LessThan:
-          cont->OverwriteAndNegateIfEqual(kUnsignedLessThan);
-          return VisitFloat64Compare(this, value, cont);
-        case IrOpcode::kFloat64LessThanOrEqual:
-          cont->OverwriteAndNegateIfEqual(kUnsignedLessThanOrEqual);
-          return VisitFloat64Compare(this, value, cont);
-        case IrOpcode::kProjection:
-          // Check if this is the overflow output projection of an
-          // <Operation>WithOverflow node.
-          if (ProjectionIndexOf(value->op()) == 1u) {
-            // We cannot combine the <Operation>WithOverflow with this branch
-            // unless the 0th projection (the use of the actual value of the
-            // <Operation> is either nullptr, which means there's no use of the
-            // actual value, or was already defined, which means it is scheduled
-            // *AFTER* this branch).
-            Node* const node = value->InputAt(0);
-            Node* const result = NodeProperties::FindProjection(node, 0);
-            if (result == nullptr || IsDefined(result)) {
-              switch (node->opcode()) {
-                case IrOpcode::kInt32AddWithOverflow:
-                  cont->OverwriteAndNegateIfEqual(kOverflow);
-                  return VisitBinop<Adapter, Int32BinopMatcher>(
-                      this, node, kRiscvAddOvf, cont);
-                case IrOpcode::kInt32SubWithOverflow:
-                  cont->OverwriteAndNegateIfEqual(kOverflow);
-                  return VisitBinop<Adapter, Int32BinopMatcher>(
-                      this, node, kRiscvSubOvf, cont);
-                case IrOpcode::kInt32MulWithOverflow:
-                  cont->OverwriteAndNegateIfEqual(kOverflow);
-                  return VisitBinop<Adapter, Int32BinopMatcher>(
-                      this, node, kRiscvMulOvf32, cont);
-                case IrOpcode::kInt64AddWithOverflow:
-                case IrOpcode::kInt64SubWithOverflow:
-                  TRACE_UNIMPL();
-                  break;
-                default:
-                  break;
-              }
+    cont->Negate();
+  }
+
+  if (CanCover(user, value)) {
+    switch (value->opcode()) {
+      case IrOpcode::kWord32Equal:
+        cont->OverwriteAndNegateIfEqual(kEqual);
+        return VisitWordCompare(this, value, cont);
+      case IrOpcode::kInt32LessThan:
+        cont->OverwriteAndNegateIfEqual(kSignedLessThan);
+        return VisitWordCompare(this, value, cont);
+      case IrOpcode::kInt32LessThanOrEqual:
+        cont->OverwriteAndNegateIfEqual(kSignedLessThanOrEqual);
+        return VisitWordCompare(this, value, cont);
+      case IrOpcode::kUint32LessThan:
+        cont->OverwriteAndNegateIfEqual(kUnsignedLessThan);
+        return VisitWordCompare(this, value, cont);
+      case IrOpcode::kUint32LessThanOrEqual:
+        cont->OverwriteAndNegateIfEqual(kUnsignedLessThanOrEqual);
+        return VisitWordCompare(this, value, cont);
+      case IrOpcode::kFloat32Equal:
+        cont->OverwriteAndNegateIfEqual(kEqual);
+        return VisitFloat32Compare(this, value, cont);
+      case IrOpcode::kFloat32LessThan:
+        cont->OverwriteAndNegateIfEqual(kUnsignedLessThan);
+        return VisitFloat32Compare(this, value, cont);
+      case IrOpcode::kFloat32LessThanOrEqual:
+        cont->OverwriteAndNegateIfEqual(kUnsignedLessThanOrEqual);
+        return VisitFloat32Compare(this, value, cont);
+      case IrOpcode::kFloat64Equal:
+        cont->OverwriteAndNegateIfEqual(kEqual);
+        return VisitFloat64Compare(this, value, cont);
+      case IrOpcode::kFloat64LessThan:
+        cont->OverwriteAndNegateIfEqual(kUnsignedLessThan);
+        return VisitFloat64Compare(this, value, cont);
+      case IrOpcode::kFloat64LessThanOrEqual:
+        cont->OverwriteAndNegateIfEqual(kUnsignedLessThanOrEqual);
+        return VisitFloat64Compare(this, value, cont);
+      case IrOpcode::kProjection:
+        // Check if this is the overflow output projection of an
+        // <Operation>WithOverflow node.
+        if (ProjectionIndexOf(value->op()) == 1u) {
+          // We cannot combine the <Operation>WithOverflow with this branch
+          // unless the 0th projection (the use of the actual value of the
+          // <Operation> is either nullptr, which means there's no use of the
+          // actual value, or was already defined, which means it is scheduled
+          // *AFTER* this branch).
+          Node* const node = value->InputAt(0);
+          Node* const result = NodeProperties::FindProjection(node, 0);
+          if (result == nullptr || IsDefined(result)) {
+            switch (node->opcode()) {
+              case IrOpcode::kInt32AddWithOverflow:
+                cont->OverwriteAndNegateIfEqual(kOverflow);
+                return VisitBinop<TurbofanAdapter, Int32BinopMatcher>(
+                    this, node, kRiscvAddOvf, cont);
+              case IrOpcode::kInt32SubWithOverflow:
+                cont->OverwriteAndNegateIfEqual(kOverflow);
+                return VisitBinop<TurbofanAdapter, Int32BinopMatcher>(
+                    this, node, kRiscvSubOvf, cont);
+              case IrOpcode::kInt32MulWithOverflow:
+                cont->OverwriteAndNegateIfEqual(kOverflow);
+                return VisitBinop<TurbofanAdapter, Int32BinopMatcher>(
+                    this, node, kRiscvMulOvf32, cont);
+              case IrOpcode::kInt64AddWithOverflow:
+              case IrOpcode::kInt64SubWithOverflow:
+                TRACE_UNIMPL();
+                break;
+              default:
+                break;
             }
           }
-          break;
-        case IrOpcode::kWord32And:
-          return VisitWordCompare(this, value, kRiscvTst32, cont, true);
-        case IrOpcode::kStackPointerGreaterThan:
-          cont->OverwriteAndNegateIfEqual(kStackPointerGreaterThanCondition);
-          return VisitStackPointerGreaterThan(value, cont);
+        }
+        break;
+      case IrOpcode::kWord32And:
+        return VisitWordCompare(this, value, kRiscvTst32, cont, true);
+      case IrOpcode::kStackPointerGreaterThan:
+        cont->OverwriteAndNegateIfEqual(kStackPointerGreaterThanCondition);
+        return VisitStackPointerGreaterThan(value, cont);
+      default:
+        break;
+    }
+  }
+
+  // Continuation could not be combined with a compare, emit compare against
+  // 0.
+  EmitWordCompareZero(this, value, cont);
+}
+
+template <>
+void InstructionSelectorT<TurboshaftAdapter>::VisitWordCompareZero(
+    node_t user, node_t value, FlagsContinuation* cont) {
+  using namespace turboshaft;  // NOLINT(build/namespaces)
+  // Try to combine with comparisons against 0 by simply inverting the branch.
+  while (const ComparisonOp* equal =
+             this->TryCast<Opmask::kWord32Equal>(value)) {
+    if (!CanCover(user, value)) break;
+    if (!MatchIntegralZero(equal->right())) break;
+
+    user = value;
+    value = equal->left();
+    cont->Negate();
+  }
+
+  const Operation& value_op = Get(value);
+  if (CanCover(user, value)) {
+    if (const ComparisonOp* comparison = value_op.TryCast<ComparisonOp>()) {
+      switch (comparison->rep.value()) {
+        case RegisterRepresentation::Word32():
+          cont->OverwriteAndNegateIfEqual(
+              GetComparisonFlagCondition(*comparison));
+          return VisitWordCompare(this, value, cont);
+        case RegisterRepresentation::Float32():
+          switch (comparison->kind) {
+            case ComparisonOp::Kind::kEqual:
+              cont->OverwriteAndNegateIfEqual(kEqual);
+              return VisitFloat32Compare(this, value, cont);
+            case ComparisonOp::Kind::kSignedLessThan:
+              cont->OverwriteAndNegateIfEqual(kFloatLessThan);
+              return VisitFloat32Compare(this, value, cont);
+            case ComparisonOp::Kind::kSignedLessThanOrEqual:
+              cont->OverwriteAndNegateIfEqual(kFloatLessThanOrEqual);
+              return VisitFloat32Compare(this, value, cont);
+            default:
+              UNREACHABLE();
+          }
+        case RegisterRepresentation::Float64():
+          switch (comparison->kind) {
+            case ComparisonOp::Kind::kEqual:
+              cont->OverwriteAndNegateIfEqual(kEqual);
+              return VisitFloat64Compare(this, value, cont);
+            case ComparisonOp::Kind::kSignedLessThan:
+              cont->OverwriteAndNegateIfEqual(kFloatLessThan);
+              return VisitFloat64Compare(this, value, cont);
+            case ComparisonOp::Kind::kSignedLessThanOrEqual:
+              cont->OverwriteAndNegateIfEqual(kFloatLessThanOrEqual);
+              return VisitFloat64Compare(this, value, cont);
+            default:
+              UNREACHABLE();
+          }
         default:
           break;
       }
+    } else if (const ProjectionOp* projection =
+                   value_op.TryCast<ProjectionOp>()) {
+      // Check if this is the overflow output projection of an
+      // <Operation>WithOverflow node.
+      if (projection->index == 1u) {
+        // We cannot combine the <Operation>WithOverflow with this branch
+        // unless the 0th projection (the use of the actual value of the
+        // <Operation> is either nullptr, which means there's no use of the
+        // actual value, or was already defined, which means it is scheduled
+        // *AFTER* this branch).
+        OpIndex node = projection->input();
+        OpIndex result = FindProjection(node, 0);
+        if (!result.valid() || IsDefined(result)) {
+          if (const OverflowCheckedBinopOp* binop =
+                  TryCast<OverflowCheckedBinopOp>(node)) {
+            const bool is64 = binop->rep == WordRepresentation::Word64();
+            if (is64) {
+              TRACE_UNIMPL();
+            } else {
+              switch (binop->kind) {
+                case OverflowCheckedBinopOp::Kind::kSignedAdd:
+                  cont->OverwriteAndNegateIfEqual(kOverflow);
+                  return VisitBinop<TurboshaftAdapter, Int32BinopMatcher>(
+                      this, node, kRiscvAddOvf, cont);
+                case OverflowCheckedBinopOp::Kind::kSignedSub:
+                  cont->OverwriteAndNegateIfEqual(kOverflow);
+                  return VisitBinop<TurboshaftAdapter, Int32BinopMatcher>(
+                      this, node, kRiscvSubOvf, cont);
+                case OverflowCheckedBinopOp::Kind::kSignedMul:
+                  cont->OverwriteAndNegateIfEqual(kOverflow);
+                  return VisitBinop<TurboshaftAdapter, Int32BinopMatcher>(
+                      this, node, kRiscvMulOvf32, cont);
+              }
+            }
+          }
+        }
+      }
     }
-
-    // Continuation could not be combined with a compare, emit compare against
-    // 0.
-    EmitWordCompareZero(this, value, cont);
   }
+
+  // Continuation could not be combined with a compare, emit compare against
+  // 0.
+  EmitWordCompareZero(this, value, cont);
 }
 
 template <typename Adapter>
@@ -1245,7 +1357,7 @@ void InstructionSelectorT<Adapter>::VisitInt32MulWithOverflow(node_t node) {
 }
 
 template <typename Adapter>
-void InstructionSelectorT<Adapter>::VisitWord32AtomicLoad(Node* node) {
+void InstructionSelectorT<Adapter>::VisitWord32AtomicLoad(node_t node) {
   if constexpr (Adapter::IsTurboshaft) {
     UNIMPLEMENTED();
   } else {
@@ -1300,6 +1412,59 @@ void InstructionSelectorT<Adapter>::VisitWord32AtomicStore(node_t node) {
 
     VisitAtomicStore(this, node, opcode, AtomicWidth::kWord32);
   }
+}
+
+template <typename Adapter>
+void VisitAtomicExchange(InstructionSelectorT<Adapter>* selector, Node* node,
+                         ArchOpcode opcode, AtomicWidth width) {
+  RiscvOperandGeneratorT<Adapter> g(selector);
+  Node* base = node->InputAt(0);
+  Node* index = node->InputAt(1);
+  Node* value = node->InputAt(2);
+
+  AddressingMode addressing_mode = kMode_MRI;
+  InstructionOperand inputs[3];
+  size_t input_count = 0;
+  inputs[input_count++] = g.UseUniqueRegister(base);
+  inputs[input_count++] = g.UseUniqueRegister(index);
+  inputs[input_count++] = g.UseUniqueRegister(value);
+  InstructionOperand outputs[1];
+  outputs[0] = g.UseUniqueRegister(node);
+  InstructionOperand temp[3];
+  temp[0] = g.TempRegister();
+  temp[1] = g.TempRegister();
+  temp[2] = g.TempRegister();
+  InstructionCode code = opcode | AddressingModeField::encode(addressing_mode) |
+                         AtomicWidthField::encode(width);
+  selector->Emit(code, 1, outputs, input_count, inputs, 3, temp);
+}
+
+template <typename Adapter>
+void VisitAtomicCompareExchange(InstructionSelectorT<Adapter>* selector,
+                                Node* node, ArchOpcode opcode,
+                                AtomicWidth width) {
+  RiscvOperandGeneratorT<Adapter> g(selector);
+  Node* base = node->InputAt(0);
+  Node* index = node->InputAt(1);
+  Node* old_value = node->InputAt(2);
+  Node* new_value = node->InputAt(3);
+
+  AddressingMode addressing_mode = kMode_MRI;
+  InstructionOperand inputs[4];
+  size_t input_count = 0;
+  inputs[input_count++] = g.UseUniqueRegister(base);
+  inputs[input_count++] = g.UseUniqueRegister(index);
+  inputs[input_count++] = g.UseUniqueRegister(old_value);
+  inputs[input_count++] = g.UseUniqueRegister(new_value);
+  InstructionOperand outputs[1];
+  outputs[0] = g.UseUniqueRegister(node);
+  InstructionOperand temp[3];
+  temp[0] = g.TempRegister();
+  temp[1] = g.TempRegister();
+  temp[2] = g.TempRegister();
+  InstructionCode code = opcode | AddressingModeField::encode(addressing_mode) |
+                         AtomicWidthField::encode(width);
+  selector->Emit(code, 1, outputs, input_count, inputs, 3, temp);
 }
 
 template <typename Adapter>
@@ -1576,8 +1741,14 @@ void InstructionSelectorT<Adapter>::VisitWord32PairSar(node_t node) {
   }
 }
 
+template <>
+void InstructionSelectorT<TurboshaftAdapter>::VisitWord32AtomicPairLoad(
+    node_t node) {
+  UNIMPLEMENTED();
+}
+
 template <typename Adapter>
-void InstructionSelectorT<Adapter>::VisitWord32AtomicPairLoad(Node* node) {
+void InstructionSelectorT<Adapter>::VisitWord32AtomicPairLoad(node_t node) {
   RiscvOperandGeneratorT<Adapter> g(this);
   Node* base = node->InputAt(0);
   Node* index = node->InputAt(1);
@@ -1607,8 +1778,14 @@ void InstructionSelectorT<Adapter>::VisitWord32AtomicPairLoad(Node* node) {
        temps);
 }
 
+template <>
+void InstructionSelectorT<TurboshaftAdapter>::VisitWord32AtomicPairStore(
+    node_t node) {
+  UNIMPLEMENTED();
+}
+
 template <typename Adapter>
-void InstructionSelectorT<Adapter>::VisitWord32AtomicPairStore(Node* node) {
+void InstructionSelectorT<Adapter>::VisitWord32AtomicPairStore(node_t node) {
   RiscvOperandGeneratorT<Adapter> g(this);
   Node* base = node->InputAt(0);
   Node* index = node->InputAt(1);
@@ -1624,10 +1801,16 @@ void InstructionSelectorT<Adapter>::VisitWord32AtomicPairStore(Node* node) {
        nullptr, arraysize(inputs), inputs, arraysize(temps), temps);
 }
 
-template <typename Adapter>
-static void VisitPairAtomicBinop(InstructionSelectorT<Adapter>* selector,
-                                 Node* node, ArchOpcode opcode) {
-  RiscvOperandGeneratorT<Adapter> g(selector);
+static void VisitPairAtomicBinop(
+    InstructionSelectorT<TurboshaftAdapter>* selector, turboshaft::OpIndex node,
+    ArchOpcode opcode) {
+  UNIMPLEMENTED();
+}
+
+static void VisitPairAtomicBinop(
+    InstructionSelectorT<TurbofanAdapter>* selector, Node* node,
+    ArchOpcode opcode) {
+  RiscvOperandGeneratorT<TurbofanAdapter> g(selector);
   Node* base = node->InputAt(0);
   Node* index = node->InputAt(1);
   Node* value = node->InputAt(2);
@@ -1660,38 +1843,44 @@ static void VisitPairAtomicBinop(InstructionSelectorT<Adapter>* selector,
 }
 
 template <typename Adapter>
-void InstructionSelectorT<Adapter>::VisitWord32AtomicPairAdd(Node* node) {
+void InstructionSelectorT<Adapter>::VisitWord32AtomicPairAdd(node_t node) {
   VisitPairAtomicBinop(this, node, kRiscvWord32AtomicPairAdd);
 }
 
 template <typename Adapter>
-void InstructionSelectorT<Adapter>::VisitWord32AtomicPairSub(Node* node) {
+void InstructionSelectorT<Adapter>::VisitWord32AtomicPairSub(node_t node) {
   VisitPairAtomicBinop(this, node, kRiscvWord32AtomicPairSub);
 }
 
 template <typename Adapter>
-void InstructionSelectorT<Adapter>::VisitWord32AtomicPairAnd(Node* node) {
+void InstructionSelectorT<Adapter>::VisitWord32AtomicPairAnd(node_t node) {
   VisitPairAtomicBinop(this, node, kRiscvWord32AtomicPairAnd);
 }
 
 template <typename Adapter>
-void InstructionSelectorT<Adapter>::VisitWord32AtomicPairOr(Node* node) {
+void InstructionSelectorT<Adapter>::VisitWord32AtomicPairOr(node_t node) {
   VisitPairAtomicBinop(this, node, kRiscvWord32AtomicPairOr);
 }
 
 template <typename Adapter>
-void InstructionSelectorT<Adapter>::VisitWord32AtomicPairXor(Node* node) {
+void InstructionSelectorT<Adapter>::VisitWord32AtomicPairXor(node_t node) {
   VisitPairAtomicBinop(this, node, kRiscvWord32AtomicPairXor);
 }
 
 template <typename Adapter>
-void InstructionSelectorT<Adapter>::VisitWord32AtomicPairExchange(Node* node) {
+void InstructionSelectorT<Adapter>::VisitWord32AtomicPairExchange(node_t node) {
   VisitPairAtomicBinop(this, node, kRiscvWord32AtomicPairExchange);
+}
+
+template <>
+void InstructionSelectorT<
+    TurboshaftAdapter>::VisitWord32AtomicPairCompareExchange(node_t node) {
+  UNIMPLEMENTED();
 }
 
 template <typename Adapter>
 void InstructionSelectorT<Adapter>::VisitWord32AtomicPairCompareExchange(
-    Node* node) {
+    node_t node) {
   RiscvOperandGeneratorT<Adapter> g(this);
   InstructionOperand inputs[] = {
       g.UseRegister(node->InputAt(0)),  g.UseRegister(node->InputAt(1)),
