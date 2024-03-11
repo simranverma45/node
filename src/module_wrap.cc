@@ -122,14 +122,16 @@ v8::Maybe<bool> ModuleWrap::CheckUnsettledTopLevelAwait() {
   if (!module->IsGraphAsync()) {  // There is no TLA, no need to check.
     return v8::Just(true);
   }
-  auto stalled = module->GetStalledTopLevelAwaitMessage(isolate);
-  if (stalled.size() == 0) {
+
+  auto stalled_messages =
+      std::get<1>(module->GetStalledTopLevelAwaitMessages(isolate));
+  if (stalled_messages.size() == 0) {
     return v8::Just(true);
   }
 
   if (env()->options()->warnings) {
-    for (auto pair : stalled) {
-      Local<v8::Message> message = std::get<1>(pair);
+    for (size_t i = 0; i < stalled_messages.size(); i++) {
+      Local<v8::Message> message = stalled_messages[i];
 
       std::string reason = "Warning: Detected unsettled top-level await at ";
       std::string info =
